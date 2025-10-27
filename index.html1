@@ -1,0 +1,598 @@
+"use client";
+
+import { useState, useRef } from "react";
+import * as XLSX from "xlsx";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
+interface ConvertedProposal {
+  projectCode: string;
+  contractNumber: string;
+  classId: string;
+  projectName: string;
+  trainingProgram: string;
+  trainingStartDate: string;
+  trainingEndDate: string;
+  customerName: string;
+  typeOfService: string;
+  durationDays: string;
+}
+
+export default function Converter() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textAreaRef = useRef<HTMLTextAreaElement>(null);
+  const [convertedData, setConvertedData] = useState<ConvertedProposal[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState("upload");
+
+  /** Utils */
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+
+  const findColumnIndex = (needle: string, headers: string[]): number => {
+    const n = norm(needle);
+    // 1) match exato
+    let idx = headers.findIndex(h => norm(h) === n);
+    if (idx >= 0) return idx;
+    // 2) match por palavra inteira
+    idx = headers.findIndex(h => new RegExp(`\\b${n}\\b`).test(norm(h)));
+    if (idx >= 0) return idx;
+    // 3) fallback: inclui
+    return headers.findIndex(h => norm(h).includes(n));
+  };
+
+  /** Parsing Principal (ordem corrigida: HTML -> TAB -> CSV) */
+  const parseTableData = (content: string): ConvertedProposal[] | null => {
+    try {
+      // 1) HTML
+      if (content.includes("<table") || content.includes("<tr")) {
+        return parseHTMLTable(content);
+      }
+      // 2) Tab-separated (Excel colado)
+      if (content.includes("\t")) {
+        return parseTabSeparated(content);
+      }
+      // 3) CSV (suporta ; e ,)
+      if (content.includes(",") || content.includes(";")) {
+        return parseCSVTable(content);
+      }
+      return null;
+    } catch (err) {
+      console.error("Error parsing table:", err);
+      return null;
+    }
+  };
+
+  /** Parser HTML (evita duplicar cabeçalhos) */
+  const parseHTMLTable = (htmlContent: string): ConvertedProposal[] | null => {
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(htmlContent, "text/html");
+      const table = doc.querySelector("table");
+      if (!table) return null;
+
+      const headers: string[] = [];
+      const theadCells = table.querySelectorAll("thead tr th, thead tr td");
+      if (theadCells.length > 0) {
+        theadCells.forEach(cell => headers.push(cell.textContent?.trim() || ""));
+      } else {
+        const firstRow = table.querySelector("tr");
+        if (firstRow) {
+          firstRow.querySelectorAll("th, td").forEach(cell => headers.push(cell.textContent?.trim() || ""));
+        }
+      }
+
+      let rowsEls: NodeListOf<HTMLTableRowElement>;
+      const tbodyRows = table.querySelectorAll("tbody tr");
+      if (tbodyRows.length > 0) {
+        rowsEls = tbodyRows as NodeListOf<HTMLTableRowElement>;
+      } else {
+        // fallback quando não há <tbody> (pular a primeira linha se foi usada como header)
+        rowsEls = table.querySelectorAll("tr") as NodeListOf<HTMLTableRowElement>;
+      }
+
+      const rows: string[][] = [];
+      rowsEls.forEach((row, idx) => {
+        const cells: string[] = [];
+        row.querySelectorAll("td, th").forEach(cell => cells.push(cell.textContent?.trim() || ""));
+        // Se não há thead e estamos na primeira linha como header, pule
+        if (theadCells.length === 0 && idx === 0) return;
+        if (cells.length > 0 && cells.some(c => c.length > 0)) {
+          // ignore linhas totalmente de header
+          const isHeaderRow = Array.from(row.querySelectorAll("th")).length === cells.length;
+          if (!isHeaderRow) rows.push(cells);
+        }
+      });
+
+      if (headers.length === 0 || rows.length === 0) return null;
+      return convertTableToProposals(headers, rows);
+    } catch {
+      return null;
+    }
+  };
+
+  /** CSV robusto: detecta delimitador e considera aspas */
+  const parseCSVTable = (csvContent: string): ConvertedProposal[] | null => {
+    try {
+      const text = csvContent.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+      const lines = splitCSVIntoLines(text);
+      if (lines.length < 2) return null;
+
+      // Detecta delimitador por linha de cabeçalho
+      const headerLine = lines[0];
+      const delim = detectDelimiter(headerLine);
+
+      const headers = parseCSVLine(headerLine, delim).map(h => h.trim());
+      const rows = lines.slice(1)
+        .map(l => parseCSVLine(l, delim).map(c => c.trim()))
+        .filter(r => r.length > 0 && r.some(c => c.length > 0));
+
+      if (headers.length === 0 || rows.length === 0) return null;
+      return convertTableToProposals(headers, rows);
+    } catch {
+      return null;
+    }
+  };
+
+  // Divide o texto em linhas respeitando aspas que podem conter quebras (simples, mas funcional p/ maioria)
+  const splitCSVIntoLines = (text: string): string[] => {
+    const lines: string[] = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      const next = text[i + 1];
+
+      if (ch === '"') {
+        if (inQuotes && next === '"') {
+          // aspas escapadas
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === "\n" && !inQuotes) {
+        lines.push(current);
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    if (current.length > 0) lines.push(current);
+    return lines;
+  };
+
+  // Detecta ; quando não há , predominante
+  const detectDelimiter = (line: string): "," | ";" => {
+    const commaCount = (line.match(/,/g) || []).length;
+    const semiCount = (line.match(/;/g) || []).length;
+    if (semiCount > 0 && commaCount === 0) return ";";
+    // Heurística: se há mais ; do que , , use ;
+    if (semiCount > commaCount) return ";";
+    return ",";
+  };
+
+  // Faz split respeitando aspas
+  const parseCSVLine = (line: string, delim: "," | ";"): string[] => {
+    const out: string[] = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      const next = line[i + 1];
+
+      if (ch === '"') {
+        if (inQuotes && next === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === delim && !inQuotes) {
+        out.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    out.push(current);
+    return out;
+  };
+
+  /** Parser Tab-Separated (Excel colado) */
+  const parseTabSeparated = (content: string): ConvertedProposal[] | null => {
+    try {
+      const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().split("\n");
+      if (lines.length < 2) return null;
+
+      const headers = lines[0].split("\t").map(h => h.trim());
+      const rows = lines.slice(1)
+        .map(line => line.split("\t").map(c => c.trim()))
+        .filter(r => r.length > 0 && r.some(c => c.length > 0));
+
+      if (headers.length === 0 || rows.length === 0) return null;
+      return convertTableToProposals(headers, rows);
+    } catch {
+      return null;
+    }
+  };
+
+  /** Conversão Genérica -> ConvertedProposal */
+  const convertTableToProposals = (headers: string[], rows: string[][]): ConvertedProposal[] => {
+    const projectCodeIndex = findColumnIndex("project code", headers) >= 0 ? findColumnIndex("project code", headers) : 0;
+    const contractNumberIndex = findColumnIndex("contract", headers) >= 0 ? findColumnIndex("contract", headers) : 6;
+    const classIdIndex = findColumnIndex("class", headers) >= 0 ? findColumnIndex("class", headers) : 7;
+    const projectNameIndex = findColumnIndex("project name", headers) >= 0 ? findColumnIndex("project name", headers) : 3;
+    const trainingProgramIndex = findColumnIndex("training program", headers) >= 0 ? findColumnIndex("training program", headers) : 8;
+    const startDateIndex = findColumnIndex("start date", headers) >= 0 ? findColumnIndex("start date", headers) : 10;
+    const endDateIndex = findColumnIndex("end date", headers) >= 0 ? findColumnIndex("end date", headers) : 11;
+    const customerIndex = findColumnIndex("customer", headers) >= 0 ? findColumnIndex("customer", headers) : 1;
+    const durationIndex = findColumnIndex("duration", headers) >= 0 ? findColumnIndex("duration", headers) : 13;
+
+    return rows.map((row) => {
+      const trainingProgram = row[trainingProgramIndex] || "";
+      return {
+        projectCode: row[projectCodeIndex] || "",
+        contractNumber: row[contractNumberIndex] || "",
+        classId: row[classIdIndex] || "",
+        projectName: row[projectNameIndex] || "",
+        trainingProgram,
+        trainingStartDate: row[startDateIndex] || "",
+        trainingEndDate: row[endDateIndex] || "",
+        customerName: row[customerIndex] || "",
+        typeOfService: "Training Delivery",
+        durationDays: row[durationIndex] || "",
+      };
+    });
+  };
+
+  /** Upload de Arquivo (agora com suporte a XLSX/XLS) */
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setError(null);
+    setSuccess(null);
+    setLoading(true);
+    setFileName(file.name);
+
+    try {
+      // 1) Imagens -> endpoint OCR
+      if (file.type.startsWith("image/")) {
+        await handleImageUpload(file);
+        return;
+      }
+
+      // 2) Planilhas Excel (binárias)
+      if (file.name.toLowerCase().endsWith(".xlsx") || file.name.toLowerCase().endsWith(".xls")) {
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data);
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        // Converta para CSV para aproveitar o pipeline existente
+        const csv = XLSX.utils.sheet_to_csv(sheet);
+        const proposals = parseCSVTable(csv);
+        if (!proposals || proposals.length === 0) {
+          setError("Não foi possível extrair uma tabela válida da planilha.");
+          return;
+        }
+        setConvertedData(proposals);
+        setSuccess(`✓ ${proposals.length} linhas convertidas com sucesso!`);
+        return;
+      }
+
+      // 3) Texto (HTML/CSV/TAB)
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const content = e.target?.result as string;
+          const proposals = parseTableData(content);
+          if (!proposals || proposals.length === 0) {
+            setError("Nenhuma tabela encontrada. Certifique-se de que o arquivo contém uma tabela válida.");
+            return;
+          }
+          setConvertedData(proposals);
+          setSuccess(`✓ ${proposals.length} linhas convertidas com sucesso!`);
+        } catch (err) {
+          setError(`Erro: ${err instanceof Error ? err.message : "Erro desconhecido"}`);
+        } finally {
+          setLoading(false);
+        }
+      };
+      reader.readAsText(file);
+    } catch (err) {
+      setError(`Erro: ${err instanceof Error ? err.message : "Erro desconhecido"}`);
+      setLoading(false);
+    }
+  };
+
+  /** Upload de Imagem -> OCR backend */
+  const handleImageUpload = async (file: File) => {
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
+
+      const response = await fetch("/api/proposals/extract-table-from-image", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error("Erro ao processar imagem");
+
+      const { tableData } = await response.json();
+      const proposals = parseTableData(tableData);
+
+      if (!proposals || proposals.length === 0) {
+        setError("Nenhuma tabela encontrada na imagem. Tente uma imagem mais clara.");
+        return;
+      }
+
+      setConvertedData(proposals);
+      setSuccess(`✓ ${proposals.length} linhas extraídas da imagem com sucesso!`);
+    } catch (err) {
+      setError(`Erro: ${err instanceof Error ? err.message : "Erro ao processar imagem"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Colar Tabela */
+  const handlePasteTable = () => {
+    if (!textAreaRef.current?.value) {
+      setError("Cole uma tabela no campo de texto");
+      return;
+    }
+
+    setError(null);
+    setSuccess(null);
+    setLoading(true);
+
+    try {
+      const content = textAreaRef.current.value;
+      const proposals = parseTableData(content);
+
+      if (!proposals || proposals.length === 0) {
+        setError("Nenhuma tabela encontrada. Cole uma tabela válida (HTML, CSV ou do Excel).");
+        setLoading(false);
+        return;
+      }
+
+      setConvertedData(proposals);
+      setSuccess(`✓ ${proposals.length} linhas convertidas com sucesso!`);
+      setFileName("Tabela colada");
+    } catch (err) {
+      setError(`Erro: ${err instanceof Error ? err.message : "Erro desconhecido"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Gerar Excel */
+  const handleGenerateExcel = async () => {
+    if (convertedData.length === 0) {
+      setError("Nenhum dado para converter.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch("/api/proposals/generate-excel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proposals: convertedData }),
+      });
+
+      if (!response.ok) throw new Error("Erro ao gerar Excel");
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const projectCode = convertedData[0]?.projectCode || "export";
+      const projectName = convertedData[0]?.projectName || "proposal";
+      const sanitizedName = projectName.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+      a.download = `${projectCode} - ${sanitizedName}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+
+      // Atualizar estatísticas
+      const savedStats = JSON.parse(localStorage.getItem("proposalStats") || '{"conversions":0,"lines":0,"successRate":100,"avgTime":2}');
+      savedStats.conversions += 1;
+      savedStats.lines += convertedData.length;
+      localStorage.setItem("proposalStats", JSON.stringify(savedStats));
+
+      // Histórico
+      const firstProject = convertedData[0];
+      const excelFileName = `${firstProject.projectCode} - ${firstProject.projectName.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.xlsx`;
+      const newHistoryItem = {
+        id: Date.now().toString(),
+        fileName: fileName || "Tabela colada",
+        date: new Date().toLocaleDateString("pt-BR"),
+        time: new Date().toLocaleTimeString("pt-BR"),
+        rows: convertedData.length,
+        status: "Concluído",
+        projectCode: firstProject.projectCode || "-",
+        projectName: firstProject.projectName || "Sem nome",
+        excelFile: excelFileName,
+      };
+      const savedHistory = JSON.parse(localStorage.getItem("proposalHistory") || "[]");
+      savedHistory.unshift(newHistoryItem);
+      localStorage.setItem("proposalHistory", JSON.stringify(savedHistory));
+
+      setSuccess("✓ Arquivo Excel gerado e baixado com sucesso!");
+    } catch (err) {
+      setError(`Erro: ${err instanceof Error ? err.message : "Erro desconhecido"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold text-gray-900">Conversor de Propostas</h1>
+        <p className="text-gray-600 mt-2">Converta tabelas em propostas Excel formatadas em segundos</p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Input Section */}
+        <Card className="lg:col-span-1 shadow-lg">
+          <CardHeader>
+            <CardTitle className="text-lg">Carregar Dados</CardTitle>
+            <CardDescription>HTML, CSV, Excel ou copiar/colar</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="upload">Arquivo</TabsTrigger>
+                <TabsTrigger value="paste">Colar</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="upload" className="space-y-4 mt-4">
+                <div
+                  className="border-2 border-dashed border-blue-300 rounded-lg p-6 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-50 transition"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".html,.htm,.csv,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.bmp,.webp"
+                    onChange={handleFileUpload}
+                    className="hidden"
+                  />
+                  <svg className="w-8 h-8 text-blue-500 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+                  </svg>
+                  <p className="font-semibold text-gray-700 text-sm">Clique para carregar</p>
+                  <p className="text-xs text-gray-500">HTML, CSV, Excel ou Imagem</p>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="paste" className="space-y-4 mt-4">
+                <textarea
+                  ref={textAreaRef}
+                  placeholder="Cole sua tabela aqui (do Excel, HTML, ou CSV)..."
+                  className="w-full h-40 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                />
+                <Button
+                  onClick={handlePasteTable}
+                  disabled={loading}
+                  className="w-full bg-blue-600 hover:bg-blue-700"
+                >
+                  {loading ? "Processando..." : "Processar Tabela"}
+                </Button>
+              </TabsContent>
+            </Tabs>
+
+            {fileName && (
+              <div className="bg-blue-50 p-3 rounded text-sm text-blue-900 border border-blue-200">
+                📄 {fileName}
+              </div>
+            )}
+
+            {error && (
+              <Alert className="border-red-300 bg-red-50">
+                <AlertDescription className="text-red-800 text-sm">{error}</AlertDescription>
+              </Alert>
+            )}
+
+            {success && (
+              <Alert className="border-green-300 bg-green-50">
+                <AlertDescription className="text-green-800 text-sm">{success}</AlertDescription>
+              </Alert>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Data Preview */}
+        <Card className="lg:col-span-2 shadow-lg">
+          <CardHeader>
+            <CardTitle className="text-lg">Visualização</CardTitle>
+            <CardDescription>{convertedData.length} linhas convertidas</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {convertedData.length > 0 ? (
+              <Tabs defaultValue="table" className="w-full">
+                <TabsList className="grid w-full grid-cols-2">
+                  <TabsTrigger value="table">Tabela</TabsTrigger>
+                  <TabsTrigger value="cards">Cards</TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="table" className="mt-4">
+                  <div className="overflow-x-auto max-h-96">
+                    <table className="w-full text-sm border-collapse">
+                      <thead className="bg-blue-500 text-white sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left border">Project Code</th>
+                          <th className="px-3 py-2 text-left border">Contract</th>
+                          <th className="px-3 py-2 text-left border">Class</th>
+                          <th className="px-3 py-2 text-left border">Project Name</th>
+                          <th className="px-3 py-2 text-left border">Training Program</th>
+                          <th className="px-3 py-2 text-left border">Start Date</th>
+                          <th className="px-3 py-2 text-left border">End Date</th>
+                          <th className="px-3 py-2 text-left border">Customer</th>
+                          <th className="px-3 py-2 text-left border">Type of Service</th>
+                          <th className="px-3 py-2 text-left border">Duration (days)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {convertedData.map((r, i) => (
+                          <tr key={i} className="odd:bg-gray-50">
+                            <td className="px-3 py-2 border">{r.projectCode}</td>
+                            <td className="px-3 py-2 border">{r.contractNumber}</td>
+                            <td className="px-3 py-2 border">{r.classId}</td>
+                            <td className="px-3 py-2 border">{r.projectName}</td>
+                            <td className="px-3 py-2 border">{r.trainingProgram}</td>
+                            <td className="px-3 py-2 border">{r.trainingStartDate}</td>
+                            <td className="px-3 py-2 border">{r.trainingEndDate}</td>
+                            <td className="px-3 py-2 border">{r.customerName}</td>
+                            <td className="px-3 py-2 border">{r.typeOfService}</td>
+                            <td className="px-3 py-2 border">{r.durationDays}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="cards" className="mt-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-3">
+                  {convertedData.map((r, i) => (
+                    <div key={i} className="border rounded-lg p-3 shadow-sm">
+                      <div className="font-semibold">{r.projectCode} — {r.projectName}</div>
+                      <div className="text-sm text-gray-600 mt-1">
+                        <div><strong>Contract:</strong> {r.contractNumber}</div>
+                        <div><strong>Class:</strong> {r.classId}</div>
+                        <div><strong>Program:</strong> {r.trainingProgram}</div>
+                        <div><strong>Dates:</strong> {r.trainingStartDate} → {r.trainingEndDate}</div>
+                        <div><strong>Customer:</strong> {r.customerName}</div>
+                        <div><strong>Service:</strong> {r.typeOfService}</div>
+                        <div><strong>Duration:</strong> {r.durationDays} days</div>
+                      </div>
+                    </div>
+                  ))}
+                </TabsContent>
+              </Tabs>
+            ) : (
+              <div className="text-sm text-gray-600">Nenhum dado convertido ainda.</div>
+            )}
+
+            <div className="mt-4">
+              <Button onClick={handleGenerateExcel} disabled={loading || convertedData.length === 0} className="bg-green-600 hover:bg-green-700">
+                {loading ? "Gerando..." : "Gerar Excel"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
